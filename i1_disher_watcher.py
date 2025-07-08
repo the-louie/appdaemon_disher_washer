@@ -1,0 +1,705 @@
+"""
+Dishwasher Cycle Detection AppDaemon App
+
+This app monitors dishwasher power consumption to accurately detect when a dish cycle
+starts and ends, sending notifications accordingly.
+
+Based on historical data analysis, the dishwasher shows these patterns:
+- Idle: 0.1-0.6 watts (very low standby power)
+- Active phases: 10-60 watts (washing, rinsing, etc.)
+- Heating phases: 2000+ watts (drying)
+- Pause periods: Can drop to idle levels between phases
+- Cycle end: Returns to idle levels and stays there
+
+SPECIAL CONSIDERATIONS:
+- Dishwashers have much lower power consumption than washers
+- Multiple heating phases with pauses between them
+- False stops in the middle of cycles (double stop issue)
+- Need longer idle time to confirm real cycle end
+
+The app uses trend analysis over multiple readings to avoid false positives
+from brief pauses during the cycle and false stops.
+"""
+
+import appdaemon.plugins.hass.hassapi as hass
+import json
+import os
+from datetime import datetime, timedelta
+from collections import deque
+import statistics
+from pathlib import Path
+
+class DisherWatcher(hass.Hass):
+    """
+    Dishwasher cycle detection app that monitors power consumption patterns
+    """
+
+    def initialize(self):
+        """Initialize the app"""
+        try:
+            self.log("Initializing Disher Watcher")
+
+            # Configuration validation
+            self.persons = self.args.get("persons", [])
+            if not isinstance(self.persons, list):
+                self.log("Warning: 'persons' should be a list, using empty list", level="WARNING")
+                self.persons = []
+
+            self.disher_entity = self.args.get("disher_entity", "sensor.disher_power")
+            if not self.disher_entity:
+                self.log("Error: disher_entity is required", level="ERROR")
+                return
+
+            self.check_interval = self.args.get("check_interval", 30)  # seconds
+            if self.check_interval < 5:
+                self.log("Warning: check_interval too low, using minimum of 5 seconds", level="WARNING")
+                self.check_interval = 5
+
+            # Dishwasher-specific detection thresholds (LOOSER SENSITIVITY)
+            self.idle_threshold = self.args.get("idle_threshold", 1.2)  # watts (lower to catch more cycles)
+            self.active_threshold = self.args.get("active_threshold", 12.0)  # watts (lower to catch more cycles)
+            self.cycle_start_threshold = self.args.get("cycle_start_threshold", 15.0)  # watts (lower to catch more cycles)
+            self.trend_window = self.args.get("trend_window", 10)  # number of readings
+            self.stable_idle_time = self.args.get("stable_idle_time", 600)  # seconds (10 minutes - shorter for disher)
+            self.min_cycle_duration = self.args.get("min_cycle_duration", 480)  # 8 minutes minimum
+            self.max_power_threshold = self.args.get("max_power_threshold", 6.0)  # watts (higher for end detection)
+            self.cooldown_time = self.args.get("cooldown_time", 600)  # 10 minutes cooldown
+            self.power_spike_threshold = 20.0  # watts (lower for disher)
+            self.sustained_high_threshold = 12.0  # watts (lower)
+            self.min_sustained_readings = 4  # fewer readings required
+            self.adaptive_threshold_factor = 0.8
+
+            # State tracking
+            self.current_power = None
+            self.previous_power = None
+            self.power_history = deque(maxlen=self.trend_window)
+            self.recent_power_pattern = deque(maxlen=6)
+            self.cycle_active = False
+            self.cycle_start_time = None
+            self.last_active_time = None
+            self.stable_idle_start = None
+            self.last_cycle_end_time = None
+            self.cycle_validation_score = 0
+            self.adaptive_idle_threshold = self.idle_threshold
+            self.adaptive_active_threshold = self.active_threshold
+
+            # Double stop detection
+            self.false_stop_cooldown = 600  # 10 minutes (shorter)
+            self.last_false_stop_time = None
+            self.false_stop_count = 0
+            self.max_false_stops = 3
+
+            # Validate thresholds
+            if self.idle_threshold >= self.active_threshold:
+                self.log("Error: idle_threshold must be less than active_threshold", level="ERROR")
+                return
+
+            if self.active_threshold >= self.cycle_start_threshold:
+                self.log("Error: active_threshold must be less than cycle_start_threshold", level="ERROR")
+                return
+
+            # Machine learning and historical data storage
+            self.data_dir = self.args.get("data_dir", "disher_data")
+            self.ensure_data_directory()
+
+            # Load historical data
+            self.historical_cycles = self.load_historical_data()
+
+            # Current cycle tracking for ML
+            self.current_cycle_data = {
+                "start_time": None,
+                "power_readings": [],
+                "phases": [],
+                "max_power": 0,
+                "heating_detected": False,
+                "high_spin_detected": False
+            }
+
+            # Cycle prediction tracking
+            self.cycle_type = None
+            self.predicted_end_time = None
+            self.heating_phase_detected = False
+            self.high_spin_phase_detected = False
+
+            # Notification tracking to prevent spam
+            self.last_notification_time = {}
+            self.notification_cooldown = 300  # 5 minutes between same type notifications
+
+            # Initialize power history
+            self.log(f"Disher entity: {self.disher_entity}")
+            self.log(f"Monitoring {len(self.persons)} persons for notifications")
+            self.log(f"Thresholds - Idle: {self.idle_threshold}W, Active: {self.active_threshold}W, Start: {self.cycle_start_threshold}W")
+            self.log(f"Loaded {len(self.historical_cycles)} historical cycles for ML predictions")
+
+            # Start monitoring
+            self.run_every(self.check_power, "now", self.check_interval)
+
+            # Start prediction monitoring (check every 5 minutes)
+            self.run_every(self.check_prediction, "now", 300)
+
+            # Listen for disher entity changes
+            self.listen_state(self.on_power_change, self.disher_entity)
+
+            self.log("Disher Watcher initialized successfully")
+
+        except Exception as e:
+            self.log(f"Error initializing Disher Watcher: {e}", level="ERROR")
+
+    def ensure_data_directory(self):
+        """Ensure the data directory exists"""
+        try:
+            Path(self.data_dir).mkdir(parents=True, exist_ok=True)
+            self.log(f"Data directory ensured: {self.data_dir}")
+        except Exception as e:
+            self.log(f"Error creating data directory: {e}", level="ERROR")
+
+    def load_historical_data(self):
+        """Load historical cycle data from JSON file"""
+        try:
+            data_file = os.path.join(self.data_dir, "historical_cycles.json")
+            if os.path.exists(data_file):
+                with open(data_file, 'r') as f:
+                    data = json.load(f)
+                    self.log(f"Loaded {len(data)} historical cycles from {data_file}")
+                    return data
+            else:
+                self.log("No historical data file found, starting fresh")
+                return []
+        except Exception as e:
+            self.log(f"Error loading historical data: {e}", level="ERROR")
+            return []
+
+    def save_historical_data(self):
+        """Save historical cycle data to JSON file"""
+        try:
+            data_file = os.path.join(self.data_dir, "historical_cycles.json")
+            with open(data_file, 'w') as f:
+                json.dump(self.historical_cycles, f, indent=2, default=str)
+            self.log(f"Saved {len(self.historical_cycles)} historical cycles to {data_file}")
+        except Exception as e:
+            self.log(f"Error saving historical data: {e}", level="ERROR")
+
+    def on_power_change(self, entity, attribute, old, new, kwargs):
+        """Handle power reading changes"""
+        try:
+            if new is None or new == "unavailable":
+                return
+
+            power = float(new)
+
+            # Validate power reading
+            if power < 0:
+                self.log(f"Warning: Negative power reading ignored: {power}W", level="WARNING")
+                return
+            if power > 10000:  # Unrealistic power reading
+                self.log(f"Warning: Unrealistic power reading ignored: {power}W", level="WARNING")
+                return
+
+            self.process_power_reading(power)
+
+        except (ValueError, TypeError) as e:
+            self.log(f"Error processing power reading '{new}': {e}", level="ERROR")
+        except Exception as e:
+            self.log(f"Unexpected error in on_power_change: {e}", level="ERROR")
+
+    def check_power(self, kwargs):
+        """Periodic power check (fallback)"""
+        try:
+            power = self.get_state(self.disher_entity)
+            if power is not None and power != "unavailable":
+                try:
+                    power_float = float(power)
+                    self.process_power_reading(power_float)
+                except (ValueError, TypeError) as e:
+                    self.log(f"Error converting power reading '{power}' to float: {e}", level="ERROR")
+        except Exception as e:
+            self.log(f"Error in periodic power check: {e}", level="ERROR")
+
+    def check_prediction(self, kwargs):
+        """Periodic prediction check"""
+        if self.cycle_active and self.predicted_end_time:
+            self.send_prediction_notification()
+
+    def update_adaptive_thresholds(self):
+        """Update adaptive thresholds based on recent power readings"""
+        if len(self.power_history) < 4:
+            return
+        idle_readings = [p for p in self.power_history if p < self.idle_threshold * 2]
+        if idle_readings:
+            avg_idle = sum(idle_readings) / len(idle_readings)
+            self.adaptive_idle_threshold = max(0.3, avg_idle * 1.2)
+        high_readings = [p for p in self.power_history if p > self.active_threshold]
+        if high_readings:
+            avg_high = sum(high_readings) / len(high_readings)
+            self.adaptive_active_threshold = max(self.active_threshold, avg_high * 0.5)
+
+    def detect_power_spike(self, power):
+        """Detect power spikes"""
+        if len(self.power_history) < 2:
+            return False
+        recent_avg = sum(list(self.power_history)[-2:]) / 2
+        return power > recent_avg * 2.5 and power > self.power_spike_threshold
+
+    def validate_cycle_start(self, power):
+        """Validate cycle start with scoring system (LOOSER)"""
+        self.cycle_validation_score = 0
+        if self.detect_power_spike(power):
+            self.cycle_validation_score += 3  # More weight for spikes
+        if len(self.recent_power_pattern) >= 3:
+            recent_readings = list(self.recent_power_pattern)[-3:]
+            high_count = sum(1 for p in recent_readings if p > self.sustained_high_threshold)
+            if high_count >= 3:  # Require fewer sustained readings
+                self.cycle_validation_score += 3
+        if power > self.cycle_start_threshold:
+            self.cycle_validation_score += 2
+        if power > self.adaptive_idle_threshold * 2.5:  # Lower multiplier
+            self.cycle_validation_score += 2
+        if len(self.power_history) >= 6:  # Less history required
+            recent_readings = list(self.power_history)[-6:]
+            high_readings = sum(1 for p in recent_readings if p > self.adaptive_active_threshold)
+            if high_readings >= 4:  # Fewer high readings required
+                self.cycle_validation_score += 2
+        return self.cycle_validation_score >= 6  # Lower threshold
+
+    def validate_cycle_end(self, power):
+        """Validate cycle end with double stop protection"""
+        if not self.cycle_active:
+            return False
+        if power > self.max_power_threshold:
+            return False
+        if self.stable_idle_start is None:
+            self.stable_idle_start = datetime.now()
+            return False
+        idle_duration = (datetime.now() - self.stable_idle_start).total_seconds()
+        if idle_duration < self.stable_idle_time:
+            return False
+        if self.last_active_time is None:
+            return False
+        time_since_active = (datetime.now() - self.last_active_time).total_seconds()
+        if time_since_active < self.stable_idle_time:
+            return False
+        if self.cycle_start_time:
+            cycle_duration = (datetime.now() - self.cycle_start_time).total_seconds()
+            if cycle_duration < self.min_cycle_duration:
+                return False
+        if len(self.power_history) >= 6:
+            recent_avg = sum(list(self.power_history)[-6:]) / 6
+            if recent_avg > self.adaptive_idle_threshold * 1.5:
+                return False
+        return True
+
+    def process_power_reading(self, power):
+        """Process a power reading and detect cycle changes"""
+        try:
+            self.previous_power = self.current_power
+            self.current_power = power
+            self.power_history.append(power)
+            self.recent_power_pattern.append(power)
+            self.update_adaptive_thresholds()
+
+            # Update current cycle data for ML
+            self.update_current_cycle_data(power)
+
+            if len(self.power_history) < 4:
+                return
+
+            # Cooldown after cycle end
+            if self.last_cycle_end_time:
+                now = datetime.now()
+                if (now - self.last_cycle_end_time).total_seconds() < self.cooldown_time:
+                    return
+
+            # Detect cycle start
+            if not self.cycle_active and self.validate_cycle_start(power):
+                self.cycle_started()
+
+            # Update active time if running
+            elif self.cycle_active and power > self.adaptive_active_threshold:
+                self.last_active_time = datetime.now()
+                if self.stable_idle_start:
+                    self.stable_idle_start = None
+                self.analyze_cycle_characteristics(power)
+
+            # Detect cycle end
+            elif self.cycle_active and self.validate_cycle_end(power):
+                self.cycle_ended()
+
+        except Exception as e:
+            self.log(f"Error in process_power_reading: {e}", level="ERROR")
+
+    def cycle_started(self):
+        """Handle cycle start detection"""
+        try:
+            self.cycle_active = True
+            self.cycle_start_time = datetime.now()
+            self.last_active_time = datetime.now()
+            self.stable_idle_start = None
+
+            # Reset cycle prediction tracking
+            self.cycle_type = None
+            self.predicted_end_time = None
+            self.heating_phase_detected = False
+            self.high_spin_phase_detected = False
+
+            # Reset false stop tracking
+            self.last_false_stop_time = None
+            self.false_stop_count = 0
+
+            # Initialize current cycle tracking for ML
+            self.current_cycle_data = {
+                "start_time": self.cycle_start_time.isoformat(),
+                "power_readings": [],
+                "phases": [],
+                "max_power": 0,
+                "heating_detected": False,
+                "high_spin_detected": False
+            }
+
+            cycle_time = self.cycle_start_time.strftime("%H:%M")
+            message = f"🍽️ Dishwasher cycle started at {cycle_time}"
+
+            self.log(f"Cycle START detected at {cycle_time} (power: {self.current_power:.1f}W)")
+            self.send_notifications(message, "disher_start")
+
+        except Exception as e:
+            self.log(f"Error in cycle_started: {e}", level="ERROR")
+
+    def cycle_ended(self):
+        """Handle cycle end detection with double stop protection"""
+        try:
+            if not self.cycle_active:
+                return
+
+            # Check if this might be a false stop
+            if self.last_false_stop_time and (datetime.now() - self.last_false_stop_time).total_seconds() < self.false_stop_cooldown:
+                self.false_stop_count += 1
+                if self.false_stop_count <= self.max_false_stops:
+                    # This is likely a false stop, don't end the cycle
+                    self.log(f"False stop detected (count: {self.false_stop_count})")
+                    self.stable_idle_start = None  # Reset idle timer
+                    return
+
+            # Real cycle end
+            self.cycle_active = False
+            end_time = datetime.now()
+            cycle_time = end_time.strftime("%H:%M")
+
+            # Calculate cycle duration
+            duration = "unknown"
+            duration_minutes = 0
+            if self.cycle_start_time:
+                duration_minutes = int((end_time - self.cycle_start_time).total_seconds() / 60)
+                duration = f"{duration_minutes} minutes"
+
+            # Store cycle data for ML
+            self.store_cycle_data(duration_minutes)
+
+            message = f"✅ Dishwasher cycle finished at {cycle_time} (duration: {duration})"
+
+            self.log(f"Cycle END detected at {cycle_time} (power: {self.current_power:.1f}W, duration: {duration})")
+            self.send_notifications(message, "disher_end")
+
+            # Reset state
+            self.cycle_start_time = None
+            self.last_active_time = None
+            self.stable_idle_start = None
+            self.cycle_type = None
+            self.predicted_end_time = None
+            self.heating_phase_detected = False
+            self.high_spin_phase_detected = False
+            self.current_cycle_data = {
+                "start_time": None,
+                "power_readings": [],
+                "phases": [],
+                "max_power": 0,
+                "heating_detected": False,
+                "high_spin_detected": False
+            }
+            self.last_cycle_end_time = datetime.now()
+
+        except Exception as e:
+            self.log(f"Error in cycle_ended: {e}", level="ERROR")
+
+    def store_cycle_data(self, duration_minutes):
+        """Store completed cycle data for machine learning"""
+        try:
+            if not self.current_cycle_data["start_time"]:
+                return
+
+            # Create cycle record
+            cycle_record = {
+                "start_time": self.current_cycle_data["start_time"],
+                "end_time": datetime.now().isoformat(),
+                "duration_minutes": duration_minutes,
+                "max_power": self.current_cycle_data["max_power"],
+                "heating_detected": self.current_cycle_data["heating_detected"],
+                "high_spin_detected": self.current_cycle_data["high_spin_detected"],
+                "power_readings_count": len(self.current_cycle_data["power_readings"]),
+                "cycle_type": self.cycle_type or "unknown"
+            }
+
+            # Add to historical data
+            self.historical_cycles.append(cycle_record)
+
+            # Keep only last 100 cycles to prevent file from growing too large
+            if len(self.historical_cycles) > 100:
+                self.historical_cycles = self.historical_cycles[-100:]
+                self.log("Trimmed historical data to last 100 cycles")
+
+            # Save to file
+            self.save_historical_data()
+
+            self.log(f"Stored cycle data: {duration_minutes}min, max_power: {self.current_cycle_data['max_power']:.1f}W, heating: {self.current_cycle_data['heating_detected']}")
+
+        except Exception as e:
+            self.log(f"Error storing cycle data: {e}", level="ERROR")
+
+    def update_current_cycle_data(self, power):
+        """Update current cycle data for ML tracking"""
+        try:
+            if not self.cycle_active:
+                return
+
+            # Add power reading with timestamp
+            reading = {
+                "timestamp": datetime.now().isoformat(),
+                "power": power
+            }
+            self.current_cycle_data["power_readings"].append(reading)
+
+            # Update max power
+            if power > self.current_cycle_data["max_power"]:
+                self.current_cycle_data["max_power"] = power
+
+            # Detect phases (dishwasher-specific thresholds)
+            if power > 2000 and not self.current_cycle_data["heating_detected"]:
+                self.current_cycle_data["heating_detected"] = True
+                self.current_cycle_data["phases"].append({
+                    "type": "heating",
+                    "timestamp": datetime.now().isoformat(),
+                    "power": power
+                })
+
+            if power > 100 and not self.current_cycle_data["high_spin_detected"]:
+                self.current_cycle_data["high_spin_detected"] = True
+                self.current_cycle_data["phases"].append({
+                    "type": "high_spin",
+                    "timestamp": datetime.now().isoformat(),
+                    "power": power
+                })
+
+        except Exception as e:
+            self.log(f"Error updating current cycle data: {e}", level="ERROR")
+
+    def send_notifications(self, message, notification_type):
+        """Send notifications to all configured persons with spam protection"""
+        try:
+            # Check notification cooldown
+            now = datetime.now()
+            if notification_type in self.last_notification_time:
+                time_since_last = (now - self.last_notification_time[notification_type]).total_seconds()
+                if time_since_last < self.notification_cooldown:
+                    self.log(f"Notification {notification_type} skipped due to cooldown ({self.notification_cooldown - time_since_last:.0f}s remaining)")
+                    return
+
+            # Sanitize message
+            sanitized_message = self._sanitize_message(message)
+            title = self._sanitize_message(f"Dishwasher Monitor - {notification_type.replace('_', ' ').title()}")
+
+            # Send notifications
+            success_count = 0
+            for person in self.persons:
+                try:
+                    if not isinstance(person, dict):
+                        self.log(f"Warning: Invalid person configuration: {person}", level="WARNING")
+                        continue
+
+                    person_name = person.get("name", "unknown")
+                    notify_service = person.get("notify")
+
+                    # Check if this notification type is enabled for this person
+                    if not person.get(f"{notification_type}_enabled", True):
+                        self.log(f"Skipping {notification_type} notification for {person_name} (disabled)")
+                        continue
+
+                    # Check if notify service is configured
+                    if not notify_service:
+                        self.log(f"No notify service configured for {person_name}", level="WARNING")
+                        continue
+
+                    # Use the correct AppDaemon notification format
+                    self.call_service(
+                        "notify/{}".format(notify_service),
+                        title=title,
+                        message=sanitized_message
+                    )
+                    self.log(f"Notification sent to {person_name}: {sanitized_message}")
+                    success_count += 1
+
+                except Exception as e:
+                    self.log(f"Error sending notification to {person.get('name', 'unknown')}: {e}", level="ERROR")
+
+            # Update cooldown if at least one notification was sent
+            if success_count > 0:
+                self.last_notification_time[notification_type] = now
+                self.log(f"Sent {success_count} notification(s) for {notification_type}")
+            else:
+                self.log(f"No notifications sent for {notification_type}", level="WARNING")
+
+        except Exception as e:
+            self.log(f"Error in send_notifications: {e}", level="ERROR")
+
+    def _sanitize_message(self, message):
+        """Sanitize message for safe transmission"""
+        try:
+            # Remove any potentially problematic characters
+            sanitized = str(message)
+            # Replace any non-printable characters
+            sanitized = ''.join(char for char in sanitized if char.isprintable() or char in ['\n', '\t'])
+            # Limit length to prevent issues
+            if len(sanitized) > 500:
+                sanitized = sanitized[:497] + "..."
+            return sanitized
+        except Exception as e:
+            self.log(f"Error sanitizing message: {e}", level="ERROR")
+            return "Dishwasher notification"
+
+    def analyze_cycle_characteristics(self, power):
+        """Analyze power patterns to determine cycle type and predict end time"""
+        try:
+            # Detect heating phase (2000+ watts)
+            if power > 2000:
+                if not self.heating_phase_detected:
+                    self.log(f"Heating phase detected (power: {power:.1f}W)")
+                self.heating_phase_detected = True
+
+            # Detect high spin phase (100+ watts)
+            if power > 100:
+                if not self.high_spin_phase_detected:
+                    self.log(f"High spin phase detected (power: {power:.1f}W)")
+                self.high_spin_phase_detected = True
+
+            # Determine cycle type based on characteristics
+            self.determine_cycle_type(power)
+
+        except Exception as e:
+            self.log(f"Error in analyze_cycle_characteristics: {e}", level="ERROR")
+
+    def determine_cycle_type(self, power):
+        """Determine cycle type using current characteristics"""
+        try:
+            # If we already have a cycle type, don't change it
+            if self.cycle_type:
+                return
+
+            # Use characteristics to predict cycle type
+            if self.heating_phase_detected:
+                self.cycle_type = "standard_wash"
+                self.log("Cycle type identified: standard_wash")
+                self.update_prediction()
+            else:
+                # Check if this looks like a quick wash based on power patterns
+                if power < 500 and len(self.power_history) >= 5:
+                    # Analyze recent power pattern
+                    recent_powers = list(self.power_history)[-5:]
+                    avg_power = sum(recent_powers) / len(recent_powers)
+
+                    if avg_power < 200:
+                        self.cycle_type = "quick_wash"
+                        self.log("Cycle type identified: quick_wash")
+                        self.update_prediction()
+
+        except Exception as e:
+            self.log(f"Error in determine_cycle_type: {e}", level="ERROR")
+
+    def update_prediction(self):
+        """Update cycle end prediction based on detected cycle type"""
+        try:
+            if not self.cycle_type or not self.cycle_start_time:
+                return
+
+            # Default predictions based on cycle type
+            if self.cycle_type == "standard_wash":
+                predicted_duration_minutes = 120  # 2 hours typical
+            elif self.cycle_type == "quick_wash":
+                predicted_duration_minutes = 60   # 1 hour typical
+            else:
+                predicted_duration_minutes = 90   # Default
+
+            # Use historical data if available
+            if self.historical_cycles:
+                similar_cycles = [c for c in self.historical_cycles if c.get("cycle_type") == self.cycle_type]
+                if similar_cycles:
+                    durations = [c.get("duration_minutes", 0) for c in similar_cycles if c.get("duration_minutes", 0) > 0]
+                    if durations:
+                        predicted_duration_minutes = statistics.mean(durations)
+
+            predicted_duration_seconds = predicted_duration_minutes * 60
+
+            # Calculate predicted end time
+            self.predicted_end_time = self.cycle_start_time + timedelta(seconds=predicted_duration_seconds)
+
+            # Log prediction
+            predicted_time = self.predicted_end_time.strftime("%H:%M")
+            self.log(f"Prediction: {self.cycle_type} cycle ending at {predicted_time}")
+
+        except Exception as e:
+            self.log(f"Error in update_prediction: {e}", level="ERROR")
+
+    def send_prediction_notification(self):
+        """Send prediction notification if cycle is taking longer than expected"""
+        try:
+            if not self.predicted_end_time:
+                return
+
+            now = datetime.now()
+            time_remaining = self.predicted_end_time - now
+
+            # Send notification if cycle is overdue or finishing soon
+            if time_remaining.total_seconds() <= 0:
+                overdue_minutes = abs(int(time_remaining.total_seconds() / 60))
+                message = f"⚠️ Dishwasher cycle is taking longer than expected (overdue by {overdue_minutes} minutes)"
+                self.send_notifications(message, "disher_prediction")
+            elif time_remaining.total_seconds() <= 300:  # 5 minutes
+                remaining_minutes = int(time_remaining.total_seconds() / 60)
+                message = f"⏰ Dishwasher cycle finishing soon (predicted in {remaining_minutes} minutes)"
+                self.send_notifications(message, "disher_prediction")
+
+        except Exception as e:
+            self.log(f"Error in send_prediction_notification: {e}", level="ERROR")
+
+    def terminate(self):
+        """Clean up when app is terminated"""
+        try:
+            self.log("Disher Watcher terminating - cleaning up")
+
+            # Log final status if cycle is active
+            if self.cycle_active:
+                self.log(f"Warning: Cycle was active when terminating. Start time: {self.cycle_start_time}")
+
+        except Exception as e:
+            self.log(f"Error in terminate: {e}", level="ERROR")
+
+    def get_status_summary(self):
+        """Get a summary of current status for debugging"""
+        try:
+            status = {
+                "cycle_active": self.cycle_active,
+                "current_power": self.current_power,
+                "power_history_length": len(self.power_history),
+                "cycle_type": self.cycle_type,
+                "predicted_end_time": self.predicted_end_time.isoformat() if self.predicted_end_time else None,
+                "heating_phase_detected": self.heating_phase_detected,
+                "high_spin_phase_detected": self.high_spin_phase_detected,
+                "persons_configured": len(self.persons)
+            }
+
+            if self.cycle_active and self.cycle_start_time:
+                elapsed = (datetime.now() - self.cycle_start_time).total_seconds() / 60
+                status["elapsed_minutes"] = round(elapsed, 1)
+
+            return status
+
+        except Exception as e:
+            self.log(f"Error in get_status_summary: {e}", level="ERROR")
+            return {"error": str(e)}
