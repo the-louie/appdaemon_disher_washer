@@ -664,8 +664,8 @@ class DisherWatcher(hass.Hass):
             now = datetime.now()
             time_remaining = self.predicted_end_time - now
 
-            # Send notification if cycle is overdue or finishing soon
-            if time_remaining.total_seconds() <= 0:
+            # Send notification if cycle is overdue by 15+ minutes or finishing soon
+            if time_remaining.total_seconds() <= -900:  # 15 minutes overdue (15 * 60 = 900 seconds)
                 overdue_minutes = abs(int(time_remaining.total_seconds() / 60))
                 message = f"⚠️ Dishwasher cycle is taking longer than expected (overdue by {overdue_minutes} minutes)"
                 self.send_notifications(message, "disher_prediction")
