@@ -12,17 +12,13 @@ Based on historical data analysis, the washer shows these patterns:
 
 The app uses trend analysis over multiple readings to avoid false positives
 from brief pauses during the cycle.
-
-NEW: Machine learning capabilities for improved predictions based on historical data.
 """
 
 import appdaemon.plugins.hass.hassapi as hass
-import time
 import json
 import os
 from datetime import datetime, timedelta
 from collections import deque
-import logging
 import statistics
 from pathlib import Path
 
@@ -56,27 +52,26 @@ class WasherWatcher(hass.Hass):
             self.idle_threshold = self.args.get("idle_threshold", 1.0)  # watts
             self.active_threshold = self.args.get("active_threshold", 10.0)  # watts
             self.cycle_start_threshold = self.args.get("cycle_start_threshold", 15.0)  # watts
-            self.trend_window = self.args.get("trend_window", 5)  # number of readings
-            self.stable_idle_time = self.args.get("stable_idle_time", 300)  # seconds (5 minutes)
-
-            # Strict detection parameters (ported from test_washer_script.py)
-            self.base_idle_threshold = self.args.get("idle_threshold", 1.0)
-            self.base_active_threshold = self.args.get("active_threshold", 10.0)
-            self.cycle_start_threshold = self.args.get("cycle_start_threshold", 15.0)
-            self.trend_window = self.args.get("trend_window", 10)
-            self.stable_idle_time = self.args.get("stable_idle_time", 480)  # 8 minutes
-            self.min_cycle_duration = self.args.get("min_cycle_duration", 180)  # 3 minutes
-            self.max_power_threshold = self.args.get("max_power_threshold", 30.0)
+            self.trend_window = self.args.get("trend_window", 10)  # number of readings
+            self.stable_idle_time = self.args.get("stable_idle_time", 480)  # seconds (8 minutes)
+            self.min_cycle_duration = self.args.get("min_cycle_duration", 180)  # 3 minutes minimum
+            self.max_power_threshold = self.args.get("max_power_threshold", 30.0)  # watts
             self.cooldown_time = self.args.get("cooldown_time", 300)  # 5 minutes cooldown
-            self.power_spike_threshold = 20.0
-            self.sustained_high_threshold = 12.0
-            self.min_sustained_readings = 3
-            self.adaptive_threshold_factor = 0.7
+            self.power_spike_threshold = 20.0  # watts
+            self.sustained_high_threshold = 12.0  # watts
+
+            # State tracking
+            self.current_power = None
+            self.power_history = deque(maxlen=self.trend_window)
             self.recent_power_pattern = deque(maxlen=6)
+            self.cycle_active = False
+            self.cycle_start_time = None
+            self.last_active_time = None
+            self.stable_idle_start = None
             self.last_cycle_end_time = None
             self.cycle_validation_score = 0
-            self.adaptive_idle_threshold = self.base_idle_threshold
-            self.adaptive_active_threshold = self.base_active_threshold
+            self.adaptive_idle_threshold = self.idle_threshold
+            self.adaptive_active_threshold = self.active_threshold
 
             # Validate thresholds
             if self.idle_threshold >= self.active_threshold:
@@ -107,20 +102,11 @@ class WasherWatcher(hass.Hass):
                 "high_spin_detected": False
             }
 
-            # State tracking
-            self.current_power = None
-            self.previous_power = None
-            self.power_history = deque(maxlen=self.trend_window)
-            self.cycle_active = False
-            self.cycle_start_time = None
-            self.last_active_time = None
-            self.stable_idle_start = None
-
-            # Cycle prediction tracking (FIXED: Consistent variable names)
+            # Cycle prediction tracking
             self.cycle_type = None
             self.predicted_end_time = None
-            self.heating_phase_detected = False  # FIXED: Consistent naming
-            self.high_spin_phase_detected = False  # FIXED: Consistent naming
+            self.heating_phase_detected = False
+            self.high_spin_phase_detected = False
 
             # Notification tracking to prevent spam
             self.last_notification_time = {}
@@ -307,24 +293,27 @@ class WasherWatcher(hass.Hass):
             self.send_prediction_notification()
 
     def update_adaptive_thresholds(self):
+        """Update adaptive thresholds based on recent power readings"""
         if len(self.power_history) < 4:
             return
-        idle_readings = [p for p in self.power_history if p < self.base_idle_threshold * 2]
+        idle_readings = [p for p in self.power_history if p < self.idle_threshold * 2]
         if idle_readings:
             avg_idle = sum(idle_readings) / len(idle_readings)
             self.adaptive_idle_threshold = max(0.3, avg_idle * 1.2)
-        high_readings = [p for p in self.power_history if p > self.base_active_threshold]
+        high_readings = [p for p in self.power_history if p > self.active_threshold]
         if high_readings:
             avg_high = sum(high_readings) / len(high_readings)
-            self.adaptive_active_threshold = max(self.base_active_threshold, avg_high * 0.5)
+            self.adaptive_active_threshold = max(self.active_threshold, avg_high * 0.5)
 
     def detect_power_spike(self, power):
+        """Detect power spikes"""
         if len(self.power_history) < 2:
             return False
         recent_avg = sum(list(self.power_history)[-2:]) / 2
         return power > recent_avg * 2.5 and power > self.power_spike_threshold
 
     def validate_cycle_start(self, power):
+        """Validate cycle start with scoring system"""
         self.cycle_validation_score = 0
         if self.detect_power_spike(power):
             self.cycle_validation_score += 2
@@ -344,31 +333,25 @@ class WasherWatcher(hass.Hass):
                 self.cycle_validation_score += 1
         return self.cycle_validation_score >= 5
 
-    def validate_cycle_end(self, power, timestamp=None):
+    def validate_cycle_end(self, power):
+        """Validate cycle end"""
         if not self.cycle_active:
             return False
         if power > self.max_power_threshold:
             return False
         if self.stable_idle_start is None:
-            if timestamp:
-                self.stable_idle_start = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
-            else:
-                self.stable_idle_start = datetime.now()
+            self.stable_idle_start = datetime.now()
             return False
-        if timestamp:
-            current_time = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
-        else:
-            current_time = datetime.now()
-        idle_duration = (current_time - self.stable_idle_start).total_seconds()
+        idle_duration = (datetime.now() - self.stable_idle_start).total_seconds()
         if idle_duration < self.stable_idle_time:
             return False
         if self.last_active_time is None:
             return False
-        time_since_active = (current_time - self.last_active_time).total_seconds()
+        time_since_active = (datetime.now() - self.last_active_time).total_seconds()
         if time_since_active < self.stable_idle_time:
             return False
         if self.cycle_start_time:
-            cycle_duration = (current_time - self.cycle_start_time).total_seconds()
+            cycle_duration = (datetime.now() - self.cycle_start_time).total_seconds()
             if cycle_duration < self.min_cycle_duration:
                 return False
         if len(self.power_history) >= 6:
@@ -378,9 +361,8 @@ class WasherWatcher(hass.Hass):
         return True
 
     def process_power_reading(self, power):
-        """Process a new power reading and detect cycle changes"""
+        """Process a power reading and detect cycle changes"""
         try:
-            self.previous_power = self.current_power
             self.current_power = power
             self.power_history.append(power)
             self.recent_power_pattern.append(power)
@@ -391,23 +373,28 @@ class WasherWatcher(hass.Hass):
 
             if len(self.power_history) < 4:
                 return
+
             # Cooldown after cycle end
             if self.last_cycle_end_time:
                 now = datetime.now()
                 if (now - self.last_cycle_end_time).total_seconds() < self.cooldown_time:
                     return
+
             # Detect cycle start
             if not self.cycle_active and self.validate_cycle_start(power):
                 self.cycle_started()
+
             # Update active time if running
             elif self.cycle_active and power > self.adaptive_active_threshold:
                 self.last_active_time = datetime.now()
                 if self.stable_idle_start:
                     self.stable_idle_start = None
                 self.analyze_cycle_characteristics(power)
+
             # Detect cycle end
             elif self.cycle_active and self.validate_cycle_end(power):
                 self.cycle_ended()
+
         except Exception as e:
             self.log(f"Error in process_power_reading: {e}", level="ERROR")
 
@@ -477,7 +464,7 @@ class WasherWatcher(hass.Hass):
             self.log(f"Cycle END detected at {cycle_time} (power: {self.current_power:.1f}W, duration: {duration}{prediction_info})")
             self.send_notifications(message, "washer_end")
 
-            # Reset state (FIXED: Complete state reset)
+            # Reset state
             self.cycle_start_time = None
             self.last_active_time = None
             self.stable_idle_start = None
@@ -560,7 +547,7 @@ class WasherWatcher(hass.Hass):
             if power > self.current_cycle_data["max_power"]:
                 self.current_cycle_data["max_power"] = power
 
-            # Detect phases (FIXED: Use consistent thresholds)
+            # Detect phases
             if power > 2000 and not self.current_cycle_data["heating_detected"]:
                 self.current_cycle_data["heating_detected"] = True
                 self.current_cycle_data["phases"].append({
@@ -652,43 +639,6 @@ class WasherWatcher(hass.Hass):
         except Exception as e:
             self.log(f"Error sanitizing message: {e}", level="ERROR")
             return "Washer notification"
-
-    def get_power_trend(self):
-        """Get the current power trend"""
-        if len(self.power_history) < 2:
-            return "insufficient_data"
-
-        recent = list(self.power_history)[-3:]
-        older = list(self.power_history)[:-3] if len(self.power_history) > 3 else []
-
-        if not older:
-            return "stable"
-
-        recent_avg = sum(recent) / len(recent)
-        older_avg = sum(older) / len(older)
-
-        if recent_avg > older_avg * 1.5:
-            return "increasing"
-        elif recent_avg < older_avg * 0.7:
-            return "decreasing"
-        else:
-            return "stable"
-
-    def log_status(self):
-        """Log current status for debugging"""
-        status = {
-            "current_power": self.current_power,
-            "cycle_active": self.cycle_active,
-            "power_history": list(self.power_history),
-            "trend": self.get_power_trend(),
-            "stable_idle_start": self.stable_idle_start,
-            "last_active_time": self.last_active_time,
-            "cycle_type": self.cycle_type,
-            "predicted_end_time": self.predicted_end_time,
-            "heating_phase": self.heating_phase_detected,
-            "high_spin_phase": self.high_spin_phase_detected
-        }
-        self.log(f"Status: {status}")
 
     def analyze_cycle_characteristics(self, power):
         """Analyze power patterns to determine cycle type and predict end time"""
@@ -811,22 +761,6 @@ class WasherWatcher(hass.Hass):
             self.log(f"Error in calculate_prediction_confidence: {e}", level="ERROR")
             return 0.5
 
-    def get_prediction_status(self):
-        """Get current prediction status for notifications"""
-        if not self.predicted_end_time:
-            return None
-
-        now = datetime.now()
-        time_remaining = self.predicted_end_time - now
-
-        if time_remaining.total_seconds() <= 0:
-            return "overdue"
-        elif time_remaining.total_seconds() <= 300:  # 5 minutes
-            return "finishing_soon"
-        else:
-            minutes_remaining = int(time_remaining.total_seconds() / 60)
-            return f"{minutes_remaining} minutes remaining"
-
     def send_prediction_notification(self):
         """Send prediction notification if cycle is taking longer than expected"""
         try:
@@ -884,419 +818,3 @@ class WasherWatcher(hass.Hass):
         except Exception as e:
             self.log(f"Error in get_status_summary: {e}", level="ERROR")
             return {"error": str(e)}
-
-    def test_against_historical_data(self, log_directory="data/washer"):
-        """
-        Test the script against historical log files to validate accuracy
-
-        This function processes historical log files and compares the script's
-        cycle detection with known cycle data to measure accuracy.
-        """
-        try:
-            self.log("Starting historical data validation test...")
-
-            # Statistics tracking
-            total_files = 0
-            processed_files = 0
-            total_cycles_detected = 0
-            total_cycles_expected = 0
-            double_stops = 0
-            missed_starts = 0
-            missed_ends = 0
-            false_starts = 0
-            false_ends = 0
-
-            # Timing accuracy tracking
-            start_time_deltas = []
-            end_time_deltas = []
-
-            # Process each log file
-            log_path = Path(log_directory)
-            if not log_path.exists():
-                self.log(f"Log directory not found: {log_directory}", level="ERROR")
-                return
-
-            log_files = list(log_path.glob("*.log"))
-            total_files = len(log_files)
-            self.log(f"Found {total_files} log files to process")
-
-            for log_file in sorted(log_files):
-                try:
-                    self.log(f"Processing {log_file.name}...")
-                    file_stats = self._process_single_log_file(log_file)
-
-                    if file_stats:
-                        processed_files += 1
-                        total_cycles_detected += file_stats['cycles_detected']
-                        total_cycles_expected += file_stats['cycles_expected']
-                        double_stops += file_stats['double_stops']
-                        missed_starts += file_stats['missed_starts']
-                        missed_ends += file_stats['missed_ends']
-                        false_starts += file_stats['false_starts']
-                        false_ends += file_stats['false_ends']
-                        start_time_deltas.extend(file_stats['start_deltas'])
-                        end_time_deltas.extend(file_stats['end_deltas'])
-
-                except Exception as e:
-                    self.log(f"Error processing {log_file.name}: {e}", level="ERROR")
-
-            # Calculate statistics
-            self._generate_test_report(
-                total_files, processed_files, total_cycles_detected, total_cycles_expected,
-                double_stops, missed_starts, missed_ends, false_starts, false_ends,
-                start_time_deltas, end_time_deltas
-            )
-
-        except Exception as e:
-            self.log(f"Error in test_against_historical_data: {e}", level="ERROR")
-
-    def _process_single_log_file(self, log_file):
-        """Process a single log file and extract cycle information"""
-        try:
-            # Reset script state for testing
-            self._reset_for_testing()
-
-            # Parse log file to extract expected cycles
-            expected_cycles = self._parse_log_file_for_cycles(log_file)
-
-            # Simulate power readings from log file
-            detected_cycles = self._simulate_power_readings(log_file)
-
-            # Compare expected vs detected cycles
-            comparison = self._compare_cycles(expected_cycles, detected_cycles)
-
-            return comparison
-
-        except Exception as e:
-            self.log(f"Error processing log file {log_file}: {e}", level="ERROR")
-            return None
-
-    def _reset_for_testing(self):
-        """Reset script state for testing"""
-        self.current_power = None
-        self.previous_power = None
-        self.power_history.clear()
-        self.cycle_active = False
-        self.cycle_start_time = None
-        self.last_active_time = None
-        self.stable_idle_start = None
-        self.cycle_type = None
-        self.predicted_end_time = None
-        self.heating_phase_detected = False
-        self.high_spin_phase_detected = False
-        self.current_cycle_data = {
-            "start_time": None,
-            "power_readings": [],
-            "phases": [],
-            "max_power": 0,
-            "heating_detected": False,
-            "high_spin_detected": False
-        }
-
-    def _parse_log_file_for_cycles(self, log_file):
-        """Parse log file to extract expected cycle start/end times"""
-        expected_cycles = []
-
-        try:
-            with open(log_file, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-
-            # Look for cycle start/end patterns in log
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-
-                # Extract timestamp and look for cycle indicators
-                # This is a simplified parser - adjust based on actual log format
-                if "cycle" in line.lower() or "start" in line.lower() or "end" in line.lower():
-                    # Try to extract timestamp and cycle info
-                    cycle_info = self._extract_cycle_info_from_line(line)
-                    if cycle_info:
-                        expected_cycles.append(cycle_info)
-
-            self.log(f"Extracted {len(expected_cycles)} expected cycles from {log_file.name}")
-            return expected_cycles
-
-        except Exception as e:
-            self.log(f"Error parsing log file {log_file}: {e}", level="ERROR")
-            return []
-
-    def _extract_cycle_info_from_line(self, line):
-        """Extract cycle information from a log line"""
-        try:
-            # Parse the actual log format: "2025-07-06 13:11:23 washer state: running power: 27.2 -> 21.4"
-            import re
-
-            # Extract timestamp and state information
-            pattern = r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) washer state: (\w+) power:'
-            match = re.search(pattern, line)
-
-            if not match:
-                return None
-
-            timestamp = match.group(1)
-            state = match.group(2).lower()
-
-            # Determine if this is a start or end indicator
-            if state == 'running':
-                return {'type': 'start', 'timestamp': timestamp, 'state': state, 'line': line}
-            elif state == 'idle':
-                return {'type': 'end', 'timestamp': timestamp, 'state': state, 'line': line}
-
-            return None
-
-        except Exception as e:
-            self.log(f"Error extracting cycle info from line: {e}", level="ERROR")
-            return None
-
-    def _simulate_power_readings(self, log_file):
-        """Simulate power readings from log file to test detection"""
-        detected_cycles = []
-
-        try:
-            with open(log_file, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-
-            # Extract power readings and timestamps
-            power_readings = []
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-
-                # Look for power readings (adjust pattern based on actual format)
-                power_info = self._extract_power_reading_from_line(line)
-                if power_info:
-                    power_readings.append(power_info)
-
-            # Sort by timestamp
-            power_readings.sort(key=lambda x: x['timestamp'])
-
-            # Simulate the detection algorithm
-            for reading in power_readings:
-                self.process_power_reading(reading['power'])
-
-                # Check if cycle state changed
-                if self.cycle_active and not hasattr(self, '_last_cycle_state'):
-                    self._last_cycle_state = True
-                    detected_cycles.append({
-                        'type': 'start',
-                        'timestamp': reading['timestamp'],
-                        'power': reading['power']
-                    })
-                elif not self.cycle_active and hasattr(self, '_last_cycle_state') and self._last_cycle_state:
-                    self._last_cycle_state = False
-                    detected_cycles.append({
-                        'type': 'end',
-                        'timestamp': reading['timestamp'],
-                        'power': reading['power']
-                    })
-
-            self.log(f"Detected {len(detected_cycles)} cycles from {log_file.name}")
-            return detected_cycles
-
-        except Exception as e:
-            self.log(f"Error simulating power readings from {log_file}: {e}", level="ERROR")
-            return []
-
-    def _extract_power_reading_from_line(self, line):
-        """Extract power reading from a log line"""
-        try:
-            # Parse the actual log format: "2025-07-06 13:11:23 washer state: running power: 27.2 -> 21.4"
-            import re
-
-            # Extract timestamp and power values
-            pattern = r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) washer state: \w+ power: (?:[\d.]+|unavailable) -> ([\d.]+)'
-            match = re.search(pattern, line)
-
-            if not match:
-                return None
-
-            timestamp = match.group(1)
-            power_str = match.group(2)
-
-            # Skip if power is unavailable
-            if power_str == 'unavailable':
-                return None
-
-            power = float(power_str)
-
-            if power >= 0:
-                return {'timestamp': timestamp, 'power': power}
-
-            return None
-
-        except Exception as e:
-            self.log(f"Error extracting power reading from line: {e}", level="ERROR")
-            return None
-
-    def _compare_cycles(self, expected_cycles, detected_cycles):
-        """Compare expected vs detected cycles and calculate accuracy metrics"""
-        try:
-            stats = {
-                'cycles_expected': len(expected_cycles) // 2,  # Assuming start/end pairs
-                'cycles_detected': len(detected_cycles) // 2,
-                'double_stops': 0,
-                'missed_starts': 0,
-                'missed_ends': 0,
-                'false_starts': 0,
-                'false_ends': 0,
-                'start_deltas': [],
-                'end_deltas': []
-            }
-
-            # Group expected cycles by start/end pairs
-            expected_pairs = []
-            for i in range(0, len(expected_cycles), 2):
-                if i + 1 < len(expected_cycles):
-                    start_cycle = expected_cycles[i]
-                    end_cycle = expected_cycles[i + 1]
-                    if start_cycle['type'] == 'start' and end_cycle['type'] == 'end':
-                        expected_pairs.append((start_cycle, end_cycle))
-
-            # Group detected cycles by start/end pairs
-            detected_pairs = []
-            for i in range(0, len(detected_cycles), 2):
-                if i + 1 < len(detected_cycles):
-                    start_cycle = detected_cycles[i]
-                    end_cycle = detected_cycles[i + 1]
-                    if start_cycle['type'] == 'start' and end_cycle['type'] == 'end':
-                        detected_pairs.append((start_cycle, end_cycle))
-
-            # Compare pairs
-            for exp_start, exp_end in expected_pairs:
-                # Find matching detected cycle
-                best_match = None
-                best_start_delta = float('inf')
-                best_end_delta = float('inf')
-
-                for det_start, det_end in detected_pairs:
-                    # Calculate time deltas
-                    start_delta = self._calculate_time_delta(exp_start['timestamp'], det_start['timestamp'])
-                    end_delta = self._calculate_time_delta(exp_end['timestamp'], det_end['timestamp'])
-
-                    # Check if this is a reasonable match (within 10 minutes)
-                    if abs(start_delta) <= 600 and abs(end_delta) <= 600:
-                        if abs(start_delta) + abs(end_delta) < best_start_delta + best_end_delta:
-                            best_match = (det_start, det_end)
-                            best_start_delta = start_delta
-                            best_end_delta = end_delta
-
-                if best_match:
-                    stats['start_deltas'].append(best_start_delta)
-                    stats['end_deltas'].append(best_end_delta)
-                else:
-                    stats['missed_starts'] += 1
-                    stats['missed_ends'] += 1
-
-            # Count false positives
-            for det_start, det_end in detected_pairs:
-                # Check if this detected cycle matches any expected cycle
-                matched = False
-                for exp_start, exp_end in expected_pairs:
-                    start_delta = self._calculate_time_delta(exp_start['timestamp'], det_start['timestamp'])
-                    end_delta = self._calculate_time_delta(exp_end['timestamp'], det_end['timestamp'])
-                    if abs(start_delta) <= 600 and abs(end_delta) <= 600:
-                        matched = True
-                        break
-
-                if not matched:
-                    stats['false_starts'] += 1
-                    stats['false_ends'] += 1
-
-            # Count double stops (multiple end detections for same cycle)
-            # This would require more sophisticated analysis of the detection sequence
-
-            return stats
-
-        except Exception as e:
-            self.log(f"Error comparing cycles: {e}", level="ERROR")
-            return None
-
-    def _calculate_time_delta(self, time1_str, time2_str):
-        """Calculate time difference between two timestamp strings in seconds"""
-        try:
-            # Parse timestamps using the actual format: "2025-07-06 13:11:23"
-            from datetime import datetime
-
-            time1 = datetime.strptime(time1_str, '%Y-%m-%d %H:%M:%S')
-            time2 = datetime.strptime(time2_str, '%Y-%m-%d %H:%M:%S')
-
-            delta = (time2 - time1).total_seconds()
-            return delta
-
-        except Exception as e:
-            self.log(f"Error calculating time delta: {e}", level="ERROR")
-            return 0
-
-    def _generate_test_report(self, total_files, processed_files, total_cycles_detected,
-                            total_cycles_expected, double_stops, missed_starts, missed_ends,
-                            false_starts, false_ends, start_time_deltas, end_time_deltas):
-        """Generate comprehensive test report"""
-        try:
-            self.log("=" * 60)
-            self.log("HISTORICAL DATA VALIDATION REPORT")
-            self.log("=" * 60)
-
-            # File processing stats
-            self.log(f"Files processed: {processed_files}/{total_files}")
-            self.log(f"Success rate: {(processed_files/total_files*100):.1f}%" if total_files > 0 else "N/A")
-
-            # Cycle detection stats
-            self.log(f"\nCycle Detection Statistics:")
-            self.log(f"Expected cycles: {total_cycles_expected}")
-            self.log(f"Detected cycles: {total_cycles_detected}")
-
-            if total_cycles_expected > 0:
-                detection_rate = (total_cycles_detected / total_cycles_expected) * 100
-                self.log(f"Detection rate: {detection_rate:.1f}%")
-
-            # Error analysis
-            self.log(f"\nError Analysis:")
-            self.log(f"Missed starts: {missed_starts}")
-            self.log(f"Missed ends: {missed_ends}")
-            self.log(f"False starts: {false_starts}")
-            self.log(f"False ends: {false_ends}")
-            self.log(f"Double stops: {double_stops}")
-
-            # Timing accuracy
-            if start_time_deltas:
-                avg_start_delta = sum(start_time_deltas) / len(start_time_deltas)
-                std_start_delta = statistics.stdev(start_time_deltas) if len(start_time_deltas) > 1 else 0
-                self.log(f"\nStart Time Accuracy:")
-                self.log(f"Average delta: {avg_start_delta:.1f} seconds ({avg_start_delta/60:.1f} minutes)")
-                self.log(f"Standard deviation: {std_start_delta:.1f} seconds ({std_start_delta/60:.1f} minutes)")
-                self.log(f"Min delta: {min(start_time_deltas):.1f} seconds ({min(start_time_deltas)/60:.1f} minutes)")
-                self.log(f"Max delta: {max(start_time_deltas):.1f} seconds ({max(start_time_deltas)/60:.1f} minutes)")
-
-                # Count positive/negative deltas
-                positive_deltas = [d for d in start_time_deltas if d > 0]
-                negative_deltas = [d for d in start_time_deltas if d < 0]
-                self.log(f"Later detections: {len(positive_deltas)} (avg: {sum(positive_deltas)/len(positive_deltas)/60:.1f} min)" if positive_deltas else "Later detections: 0")
-                self.log(f"Earlier detections: {len(negative_deltas)} (avg: {sum(negative_deltas)/len(negative_deltas)/60:.1f} min)" if negative_deltas else "Earlier detections: 0")
-
-            if end_time_deltas:
-                avg_end_delta = sum(end_time_deltas) / len(end_time_deltas)
-                std_end_delta = statistics.stdev(end_time_deltas) if len(end_time_deltas) > 1 else 0
-                self.log(f"\nEnd Time Accuracy:")
-                self.log(f"Average delta: {avg_end_delta:.1f} seconds ({avg_end_delta/60:.1f} minutes)")
-                self.log(f"Standard deviation: {std_end_delta:.1f} seconds ({std_end_delta/60:.1f} minutes)")
-                self.log(f"Min delta: {min(end_time_deltas):.1f} seconds ({min(end_time_deltas)/60:.1f} minutes)")
-                self.log(f"Max delta: {max(end_time_deltas):.1f} seconds ({max(end_time_deltas)/60:.1f} minutes)")
-
-                # Count positive/negative deltas
-                positive_deltas = [d for d in end_time_deltas if d > 0]
-                negative_deltas = [d for d in end_time_deltas if d < 0]
-                self.log(f"Later detections: {len(positive_deltas)} (avg: {sum(positive_deltas)/len(positive_deltas)/60:.1f} min)" if positive_deltas else "Later detections: 0")
-                self.log(f"Earlier detections: {len(negative_deltas)} (avg: {sum(negative_deltas)/len(negative_deltas)/60:.1f} min)" if negative_deltas else "Earlier detections: 0")
-
-            # Overall accuracy score
-            if total_cycles_expected > 0:
-                accuracy_score = ((total_cycles_detected - false_starts - false_ends) / total_cycles_expected) * 100
-                self.log(f"\nOverall Accuracy Score: {accuracy_score:.1f}%")
-
-            self.log("=" * 60)
-
-        except Exception as e:
-            self.log(f"Error generating test report: {e}", level="ERROR")

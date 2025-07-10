@@ -66,12 +66,9 @@ class DisherWatcher(hass.Hass):
             self.cooldown_time = self.args.get("cooldown_time", 600)  # 10 minutes cooldown
             self.power_spike_threshold = 20.0  # watts (lower for disher)
             self.sustained_high_threshold = 12.0  # watts (lower)
-            self.min_sustained_readings = 4  # fewer readings required
-            self.adaptive_threshold_factor = 0.8
 
             # State tracking
             self.current_power = None
-            self.previous_power = None
             self.power_history = deque(maxlen=self.trend_window)
             self.recent_power_pattern = deque(maxlen=6)
             self.cycle_active = False
@@ -286,12 +283,21 @@ class DisherWatcher(hass.Hass):
             recent_avg = sum(list(self.power_history)[-6:]) / 6
             if recent_avg > self.adaptive_idle_threshold * 1.5:
                 return False
+
+        # Check if this might be a false stop (dishwasher-specific)
+        if self.cycle_start_time:
+            cycle_duration = (datetime.now() - self.cycle_start_time).total_seconds()
+            # If cycle is relatively short and we haven't detected heating, might be false stop
+            if cycle_duration < 1800:  # Less than 30 minutes
+                self.last_false_stop_time = datetime.now()
+                self.log(f"Potential false stop detected (cycle duration: {cycle_duration/60:.1f}min)")
+                return False
+
         return True
 
     def process_power_reading(self, power):
         """Process a power reading and detect cycle changes"""
         try:
-            self.previous_power = self.current_power
             self.current_power = power
             self.power_history.append(power)
             self.recent_power_pattern.append(power)
@@ -379,7 +385,10 @@ class DisherWatcher(hass.Hass):
                     self.stable_idle_start = None  # Reset idle timer
                     return
 
-            # Real cycle end
+            # Real cycle end - reset false stop tracking
+            self.last_false_stop_time = None
+            self.false_stop_count = 0
+
             self.cycle_active = False
             end_time = datetime.now()
             cycle_time = end_time.strftime("%H:%M")

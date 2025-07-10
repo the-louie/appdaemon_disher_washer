@@ -1,0 +1,80 @@
+washer_watcher:
+  module: i1_washer_watcher
+  class: WasherWatcher
+
+  # Washer power sensor entity
+  washer_entity: sensor.washer_power
+
+  # Detection thresholds (in watts)
+  idle_threshold: 1.0          # Power level considered idle
+  active_threshold: 10.0       # Power level considered active
+  cycle_start_threshold: 15.0  # Power level to trigger cycle start detection
+
+  # Timing parameters
+  check_interval: 30           # How often to check power (seconds)
+  trend_window: 5              # Number of readings to keep for trend analysis
+  stable_idle_time: 300        # How long to be idle before considering cycle ended (seconds)
+
+  # Machine learning and data storage
+  data_dir: "washer_data"      # Directory to store historical cycle data
+  enable_ml_predictions: true  # Enable machine learning predictions
+  max_historical_cycles: 100   # Maximum number of cycles to keep in history
+
+  # Cycle prediction settings
+  enable_predictions: true     # Enable cycle end predictions
+  prediction_notifications: true  # Send prediction notifications
+
+  # List of persons to notify about washer events
+  persons:
+    - name: louie                    # Person's name (for reference)
+      notify: mobile_app_iphone_28  # Notification service to use
+      washer_start_enabled: true     # Enable cycle start notifications
+      washer_end_enabled: true       # Enable cycle end notifications
+      washer_prediction_enabled: true # Enable prediction notifications
+    # Add more persons as needed:
+    # - name: another_person
+    #   notify: mobile_app_android_123
+    #   washer_start_enabled: true
+    #   washer_end_enabled: true
+    #   washer_prediction_enabled: false  # Disable predictions for this person
+
+disher_watcher:
+  module: i1_disher_watcher
+  class: DisherWatcher
+
+  # Dishwasher power sensor entity
+  disher_entity: sensor.disher_power
+
+  # Detection thresholds (in watts) - LOOSER SENSITIVITY for dishwasher
+  idle_threshold: 1.2          # Power level considered idle (lower to catch more cycles)
+  active_threshold: 12.0       # Power level considered active (lower to catch more cycles)
+  cycle_start_threshold: 15.0  # Power level to trigger cycle start detection (lower to catch more cycles)
+
+  # Timing parameters
+  check_interval: 30           # How often to check power (seconds)
+  trend_window: 10             # Number of readings to keep for trend analysis
+  stable_idle_time: 600        # How long to be idle before considering cycle ended (10 minutes - shorter for disher)
+  min_cycle_duration: 480      # Minimum cycle duration (8 minutes - shorter for disher)
+  cooldown_time: 600           # Cooldown between cycles (10 minutes - shorter for disher)
+
+  # Machine learning and data storage
+  data_dir: "disher_data"      # Directory to store historical cycle data
+  max_historical_cycles: 100   # Maximum number of cycles to keep in history
+
+  # Cycle prediction settings
+  enable_predictions: true     # Enable cycle end predictions
+  prediction_notifications: true  # Send prediction notifications
+
+  # List of persons to notify about dishwasher events
+  persons:
+    - name: louie                      # Person's name (for reference)
+      notify: mobile_app_iphone_28    # Notification service to use
+      disher_start_enabled: true       # Enable cycle start notifications
+      disher_end_enabled: true         # Enable cycle end notifications
+      disher_prediction_enabled: true  # Enable prediction notifications
+    # Add more persons as needed:
+    # - name: another_person
+    #   notify: mobile_app_android_123
+    #   disher_start_enabled: true
+    #   disher_end_enabled: true
+    #   disher_prediction_enabled: false  # Disable predictions for this person
