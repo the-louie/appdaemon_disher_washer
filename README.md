@@ -268,6 +268,19 @@ The system predicts cycle end times based on historical data analysis:
 
 ## Data Structure
 
+The system stores historical cycle data in JSON format for machine learning predictions:
+
+**Washer Data**: `washer_historical_cycles.json`
+**Dishwasher Data**: `disher_historical_cycles.json`
+
+Each cycle record contains:
+- Start/end times
+- Duration in minutes
+- Maximum power consumption
+- Detected phases (heating, high spin)
+- Cycle type classification
+- Prediction accuracy metrics
+
 The system processes power readings in this format:
 ```
 YYYY-MM-DD HH:MM:SS [device] state: [state] power: [old_value] -> [new_value]
@@ -284,8 +297,8 @@ Example:
 - `i1_washer_watcher.py` - Main washer AppDaemon app
 - `i1_disher_watcher.py` - Main dishwasher AppDaemon app
 - `config.yaml` - Configuration example for both appliances
-- `data/washer/` - Historical washer log files (split by device)
-- `data/disher/` - Historical dishwasher log files (split by device)
+- `washer_historical_cycles.json` - Historical washer cycle data (ML)
+- `disher_historical_cycles.json` - Historical dishwasher cycle data (ML)
 
 ## License
 

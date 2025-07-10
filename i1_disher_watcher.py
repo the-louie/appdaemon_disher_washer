@@ -96,7 +96,7 @@ class DisherWatcher(hass.Hass):
                 return
 
             # Machine learning and historical data storage
-            self.data_dir = self.args.get("data_dir", "disher_data")
+            self.data_dir = self.args.get("data_dir", ".")
             self.ensure_data_directory()
 
             # Load historical data

@@ -16,7 +16,7 @@ washer_watcher:
   stable_idle_time: 300        # How long to be idle before considering cycle ended (seconds)
 
   # Machine learning and data storage
-  data_dir: "washer_data"      # Directory to store historical cycle data
+  data_dir: "."      # Directory to store historical cycle data (same as scripts)
   enable_ml_predictions: true  # Enable machine learning predictions
   max_historical_cycles: 100   # Maximum number of cycles to keep in history
 
@@ -58,7 +58,7 @@ disher_watcher:
   cooldown_time: 600           # Cooldown between cycles (10 minutes - shorter for disher)
 
   # Machine learning and data storage
-  data_dir: "disher_data"      # Directory to store historical cycle data
+  data_dir: "."      # Directory to store historical cycle data (same as scripts)
   max_historical_cycles: 100   # Maximum number of cycles to keep in history
 
   # Cycle prediction settings
