@@ -143,7 +143,7 @@ class WasherWatcher(hass.Hass):
     def load_historical_data(self):
         """Load historical cycle data from JSON file"""
         try:
-            data_file = os.path.join(self.data_dir, "historical_cycles.json")
+            data_file = os.path.join(self.data_dir, "washer_historical_cycles.json")
             if os.path.exists(data_file):
                 with open(data_file, 'r') as f:
                     data = json.load(f)
@@ -159,7 +159,7 @@ class WasherWatcher(hass.Hass):
     def save_historical_data(self):
         """Save historical cycle data to JSON file"""
         try:
-            data_file = os.path.join(self.data_dir, "historical_cycles.json")
+            data_file = os.path.join(self.data_dir, "washer_historical_cycles.json")
             with open(data_file, 'w') as f:
                 json.dump(self.historical_cycles, f, indent=2, default=str)
             self.log(f"Saved {len(self.historical_cycles)} historical cycles to {data_file}")
