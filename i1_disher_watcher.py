@@ -86,6 +86,14 @@ class DisherWatcher(hass.Hass):
             self.false_stop_count = 0
             self.max_false_stops = 3
 
+            # Android companion-app delivery settings. The default HA notification channel
+            # can be disabled on the phone, which silently discards every notification sent
+            # to it - HA reports success and nothing arrives. Sending on a dedicated channel
+            # keeps these alerts independent of that setting and lets them be muted on
+            # their own without affecting other apps. See backlog T-52.
+            self.notification_channel = self.args.get("notification_channel", "appliance_alerts")
+            self.notification_priority = self.args.get("notification_priority", "high")
+
             # Validate thresholds
             if self.idle_threshold >= self.active_threshold:
                 self.log("Error: idle_threshold must be less than active_threshold", level="ERROR")
@@ -97,6 +105,7 @@ class DisherWatcher(hass.Hass):
 
             # Machine learning and historical data storage
             self.data_dir = self.args.get("data_dir", ".")
+
             self.ensure_data_directory()
 
             # Load historical data
@@ -540,7 +549,8 @@ class DisherWatcher(hass.Hass):
                     self.call_service(
                         "notify/{}".format(notify_service),
                         title=title,
-                        message=sanitized_message
+                        message=sanitized_message,
+                        data=self._notification_data()
                     )
                     self.log(f"Notification sent to {person_name}: {sanitized_message}")
                     success_count += 1
@@ -572,6 +582,22 @@ class DisherWatcher(hass.Hass):
         except Exception as e:
             self.log(f"Error sanitizing message: {e}", level="ERROR")
             return "Dishwasher notification"
+
+    def _notification_data(self) -> dict:
+        """Build the companion-app data block for a notification.
+
+        Returns the Android delivery hints every notify call in this app must carry:
+        a dedicated channel, plus priority/ttl so the message is not deferred by Doze.
+        Returns an empty dict if no channel is configured, so the caller can pass it
+        unconditionally.
+        """
+        if not self.notification_channel:
+            return {}
+        data = {"channel": self.notification_channel}
+        if self.notification_priority:
+            data["priority"] = self.notification_priority
+            data["ttl"] = 0
+        return data
 
     def analyze_cycle_characteristics(self, power):
         """Analyze power patterns to determine cycle type and predict end time"""
