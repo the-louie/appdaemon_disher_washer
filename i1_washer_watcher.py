@@ -297,9 +297,16 @@ class WasherWatcher(hass.Hass):
             self.log(f"Error in periodic power check: {e}", level="ERROR")
 
     def check_prediction(self, kwargs):
-        """Periodic prediction check"""
+        """Periodic prediction check. Logs only -- deliberately does not notify.
+
+        This used to call send_prediction_notification(), which produced three
+        messages for a single cycle with the countdown running backwards
+        ("finishing soon (predicted in -13 minutes)"). Owner's decision
+        2026-09-05: notify when the cycle starts and when it actually ends,
+        nothing in between. See T-58.
+        """
         if self.cycle_active and self.predicted_end_time:
-            self.send_prediction_notification()
+            self.log_prediction_status()
 
     def update_adaptive_thresholds(self):
         """Update adaptive thresholds based on recent power readings"""
@@ -787,27 +794,46 @@ class WasherWatcher(hass.Hass):
             self.log(f"Error in calculate_prediction_confidence: {e}", level="ERROR")
             return 0.5
 
-    def send_prediction_notification(self):
-        """Send prediction notification if cycle is taking longer than expected"""
+    def log_prediction_status(self):
+        """Log how the cycle is tracking against its prediction. Never notifies.
+
+        Replaces send_prediction_notification (T-58). That method branched on
+        `time_remaining <= -900` for "overdue" and `<= 300` for "finishing
+        soon", and because neither branch had a said-this-already latch, the
+        second stayed true from the predicted end until 15 minutes past it --
+        firing every 5 minutes with an ever more negative countdown -- and then
+        handed over to the first, which repeated indefinitely until the cycle
+        genuinely ended. The per-type cooldown paced that rather than stopping
+        it.
+
+        The estimate itself is worth keeping: it is how the ML durations get
+        tuned. It is the notification that was wrong, not the number. Note the
+        clamp at zero -- a "remaining" time is never negative; past the
+        prediction the honest word is "overdue".
+        """
         try:
             if not self.predicted_end_time:
                 return
 
-            now = datetime.now()
-            time_remaining = self.predicted_end_time - now
-
-            # Send notification if cycle is overdue by 15+ minutes or finishing soon
-            if time_remaining.total_seconds() <= -900:  # 15 minutes overdue (15 * 60 = 900 seconds)
-                overdue_minutes = abs(int(time_remaining.total_seconds() / 60))
-                message = f"⚠️ Washer cycle is taking longer than expected (overdue by {overdue_minutes} minutes)"
-                self.send_notifications(message, "washer_prediction")
-            elif time_remaining.total_seconds() <= 300:  # 5 minutes
-                remaining_minutes = int(time_remaining.total_seconds() / 60)
-                message = f"⏰ Washer cycle finishing soon (predicted in {remaining_minutes} minutes)"
-                self.send_notifications(message, "washer_prediction")
+            remaining = (self.predicted_end_time - datetime.now()).total_seconds()
+            if remaining >= 0:
+                self.log(
+                    "%s cycle tracking: ~%d min remaining (predicted end %s)"
+                    % ("Washer", int(remaining / 60),
+                       self.predicted_end_time.strftime("%H:%M")),
+                    level="DEBUG",
+                )
+            else:
+                self.log(
+                    "%s cycle is %d min past its predicted end of %s and still "
+                    "running -- not notifying, the end event will"
+                    % ("Washer", int(-remaining / 60),
+                       self.predicted_end_time.strftime("%H:%M")),
+                    level="DEBUG",
+                )
 
         except Exception as e:
-            self.log(f"Error in send_prediction_notification: {e}", level="ERROR")
+            self.log(f"Error in log_prediction_status: {e}", level="ERROR")
 
     def terminate(self):
         """Clean up when app is terminated"""
