@@ -52,7 +52,20 @@ class WasherWatcher(hass.Hass):
             self.idle_threshold = self.args.get("idle_threshold", 1.0)  # watts
             self.active_threshold = self.args.get("active_threshold", 10.0)  # watts
             self.cycle_start_threshold = self.args.get("cycle_start_threshold", 15.0)  # watts
-            self.trend_window = self.args.get("trend_window", 10)  # number of readings
+            trend_window = self.args.get("trend_window", 10)  # number of readings
+            # The validation scoring hardcodes checks over the last 6 readings,
+            # so a window below 6 silently deletes those criteria -- with 5,
+            # the washer could never reach the start-detection bar at all
+            # (T-05). Floored rather than refused: the deployed washer config
+            # says 5, and a raise here would take a working notification path
+            # down over one number, while the floor restores the behaviour the
+            # config author plainly wanted.
+            self.trend_window = max(6, int(trend_window))
+            if self.trend_window != trend_window:
+                self.log(
+                    f"trend_window {trend_window} is below the 6 readings the "
+                    f"validation scoring inspects; using {self.trend_window}",
+                    level="WARNING")
             self.stable_idle_time = self.args.get("stable_idle_time", 480)  # seconds (8 minutes)
             self.min_cycle_duration = self.args.get("min_cycle_duration", 180)  # 3 minutes minimum
             self.max_power_threshold = self.args.get("max_power_threshold", 30.0)  # watts
@@ -322,10 +335,22 @@ class WasherWatcher(hass.Hass):
             self.adaptive_active_threshold = max(self.active_threshold, avg_high * 0.5)
 
     def detect_power_spike(self, power):
-        """Detect power spikes"""
-        if len(self.power_history) < 2:
+        """Detect power spikes -- against the readings BEFORE this one.
+
+        The reading is appended to power_history before validation runs, so the
+        old comparison against history[-2:] included `power` itself:
+        power > 2.5*(prev+power)/2 simplifies to -0.5*power > 2.5*prev, which
+        no positive wattage can satisfy. The points this criterion carries were
+        unreachable for the app's whole life (T-05). For the washer (criteria
+        2/2/1/1/1, bar 5) that capped the maximum score at 4 -- it could never
+        detect a cycle start. The disher's deliberately looser scoring
+        (3/3/2/2/2, bar 6) still cleared the bar without the spike, which is
+        why it worked; the dead criterion cost it sensitivity, not function.
+        """
+        prior = list(self.power_history)[:-1]
+        if len(prior) < 2:
             return False
-        recent_avg = sum(list(self.power_history)[-2:]) / 2
+        recent_avg = sum(prior[-2:]) / 2
         return power > recent_avg * 2.5 and power > self.power_spike_threshold
 
     def validate_cycle_start(self, power):
