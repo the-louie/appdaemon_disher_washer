@@ -17,6 +17,7 @@ from brief pauses during the cycle.
 import appdaemon.plugins.hass.hassapi as hass
 import json
 import os
+import time
 from datetime import datetime, timedelta
 from collections import deque
 import statistics
@@ -381,18 +382,18 @@ class WasherWatcher(hass.Hass):
         if power > self.max_power_threshold:
             return False
         if self.stable_idle_start is None:
-            self.stable_idle_start = datetime.now()
+            self.stable_idle_start = time.time()
             return False
-        idle_duration = (datetime.now() - self.stable_idle_start).total_seconds()
+        idle_duration = time.time() - self.stable_idle_start
         if idle_duration < self.stable_idle_time:
             return False
         if self.last_active_time is None:
             return False
-        time_since_active = (datetime.now() - self.last_active_time).total_seconds()
+        time_since_active = time.time() - self.last_active_time
         if time_since_active < self.stable_idle_time:
             return False
         if self.cycle_start_time:
-            cycle_duration = (datetime.now() - self.cycle_start_time).total_seconds()
+            cycle_duration = time.time() - self.cycle_start_time
             if cycle_duration < self.min_cycle_duration:
                 return False
         if len(self.power_history) >= 6:
@@ -417,8 +418,8 @@ class WasherWatcher(hass.Hass):
 
             # Cooldown after cycle end
             if self.last_cycle_end_time:
-                now = datetime.now()
-                if (now - self.last_cycle_end_time).total_seconds() < self.cooldown_time:
+                now = time.time()
+                if now - self.last_cycle_end_time < self.cooldown_time:
                     return
 
             # Detect cycle start
@@ -427,7 +428,7 @@ class WasherWatcher(hass.Hass):
 
             # Update active time if running
             elif self.cycle_active and power > self.adaptive_active_threshold:
-                self.last_active_time = datetime.now()
+                self.last_active_time = time.time()
                 if self.stable_idle_start:
                     self.stable_idle_start = None
                 self.analyze_cycle_characteristics(power)
@@ -443,8 +444,8 @@ class WasherWatcher(hass.Hass):
         """Handle cycle start detection"""
         try:
             self.cycle_active = True
-            self.cycle_start_time = datetime.now()
-            self.last_active_time = datetime.now()
+            self.cycle_start_time = time.time()
+            self.last_active_time = time.time()
             self.stable_idle_start = None
 
             # Reset cycle prediction tracking
@@ -455,7 +456,7 @@ class WasherWatcher(hass.Hass):
 
             # Initialize current cycle tracking for ML
             self.current_cycle_data = {
-                "start_time": self.cycle_start_time.isoformat(),
+                "start_time": self._wall(self.cycle_start_time).isoformat(),
                 "power_readings": [],
                 "phases": [],
                 "max_power": 0,
@@ -463,7 +464,7 @@ class WasherWatcher(hass.Hass):
                 "high_spin_detected": False
             }
 
-            cycle_time = self.cycle_start_time.strftime("%H:%M")
+            cycle_time = self._wall(self.cycle_start_time).strftime("%H:%M")
             message = f"🧺 Washer cycle started at {cycle_time}"
 
             self.log(f"Cycle START detected at {cycle_time} (power: {self.current_power:.1f}W)")
@@ -479,14 +480,14 @@ class WasherWatcher(hass.Hass):
                 return
 
             self.cycle_active = False
-            end_time = datetime.now()
-            cycle_time = end_time.strftime("%H:%M")
+            end_time = time.time()
+            cycle_time = self._wall(end_time).strftime("%H:%M")
 
             # Calculate cycle duration
             duration = "unknown"
             duration_minutes = 0
             if self.cycle_start_time:
-                duration_minutes = int((end_time - self.cycle_start_time).total_seconds() / 60)
+                duration_minutes = int((end_time - self.cycle_start_time) / 60)
                 duration = f"{duration_minutes} minutes"
 
             # Store cycle data for ML
@@ -521,7 +522,7 @@ class WasherWatcher(hass.Hass):
                 "heating_detected": False,
                 "high_spin_detected": False
             }
-            self.last_cycle_end_time = datetime.now()
+            self.last_cycle_end_time = time.time()
 
         except Exception as e:
             self.log(f"Error in cycle_ended: {e}", level="ERROR")
@@ -535,7 +536,7 @@ class WasherWatcher(hass.Hass):
             # Create cycle record
             cycle_record = {
                 "start_time": self.current_cycle_data["start_time"],
-                "end_time": datetime.now().isoformat(),
+                "end_time": self.get_now().isoformat(),
                 "duration_minutes": duration_minutes,
                 "max_power": self.current_cycle_data["max_power"],
                 "heating_detected": self.current_cycle_data["heating_detected"],
@@ -579,7 +580,7 @@ class WasherWatcher(hass.Hass):
 
             # Add power reading with timestamp
             reading = {
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": self.get_now().isoformat(),
                 "power": power
             }
             self.current_cycle_data["power_readings"].append(reading)
@@ -593,7 +594,7 @@ class WasherWatcher(hass.Hass):
                 self.current_cycle_data["heating_detected"] = True
                 self.current_cycle_data["phases"].append({
                     "type": "heating",
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": self.get_now().isoformat(),
                     "power": power
                 })
 
@@ -601,20 +602,30 @@ class WasherWatcher(hass.Hass):
                 self.current_cycle_data["high_spin_detected"] = True
                 self.current_cycle_data["phases"].append({
                     "type": "high_spin",
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": self.get_now().isoformat(),
                     "power": power
                 })
 
         except Exception as e:
             self.log(f"Error updating current cycle data: {e}", level="ERROR")
 
+    def _wall(self, epoch: float) -> datetime:
+        """The wall-clock reading of an epoch stamp, in Home Assistant's zone.
+
+        All timing state in this app is epoch floats (S8-02, T-07): durations
+        survive the DST fold that naive-datetime subtraction lies across.
+        Only display goes through here, and fromtimestamp(tz=...) is
+        fold-correct where get_now() + timedelta arithmetic would not be.
+        """
+        return datetime.fromtimestamp(epoch, tz=self.get_now().tzinfo)
+
     def send_notifications(self, message, notification_type):
         """Send notifications to all configured persons with spam protection"""
         try:
             # Check notification cooldown
-            now = datetime.now()
+            now = time.time()
             if notification_type in self.last_notification_time:
-                time_since_last = (now - self.last_notification_time[notification_type]).total_seconds()
+                time_since_last = now - self.last_notification_time[notification_type]
                 if time_since_last < self.notification_cooldown:
                     self.log(f"Notification {notification_type} skipped due to cooldown ({self.notification_cooldown - time_since_last:.0f}s remaining)")
                     return
@@ -768,10 +779,10 @@ class WasherWatcher(hass.Hass):
             predicted_duration_seconds = predicted_duration_minutes * 60
 
             # Calculate predicted end time
-            self.predicted_end_time = self.cycle_start_time + timedelta(seconds=predicted_duration_seconds)
+            self.predicted_end_time = self.cycle_start_time + predicted_duration_seconds
 
             # Log prediction with confidence
-            predicted_time = self.predicted_end_time.strftime("%H:%M")
+            predicted_time = self._wall(self.predicted_end_time).strftime("%H:%M")
             confidence = self.calculate_prediction_confidence(prediction_data)
             self.log(f"ML Prediction: {self.cycle_type} cycle ending at {predicted_time} (±{prediction_data['std_duration']:.0f} min, confidence: {confidence:.1%})")
 
@@ -840,20 +851,20 @@ class WasherWatcher(hass.Hass):
             if not self.predicted_end_time:
                 return
 
-            remaining = (self.predicted_end_time - datetime.now()).total_seconds()
+            remaining = self.predicted_end_time - time.time()
             if remaining >= 0:
                 self.log(
-                    "%s cycle tracking: ~%d min remaining (predicted end %s)"
-                    % ("Washer", int(remaining / 60),
-                       self.predicted_end_time.strftime("%H:%M")),
+                    f"Washer cycle tracking: ~{int(remaining / 60)} min "
+                    f"remaining (predicted end "
+                    f"{self._wall(self.predicted_end_time).strftime('%H:%M')})",
                     level="DEBUG",
                 )
             else:
                 self.log(
-                    "%s cycle is %d min past its predicted end of %s and still "
-                    "running -- not notifying, the end event will"
-                    % ("Washer", int(-remaining / 60),
-                       self.predicted_end_time.strftime("%H:%M")),
+                    f"Washer cycle is {int(-remaining / 60)} min past its "
+                    f"predicted end of "
+                    f"{self._wall(self.predicted_end_time).strftime('%H:%M')} "
+                    f"and still running -- not notifying, the end event will",
                     level="DEBUG",
                 )
 
@@ -880,14 +891,14 @@ class WasherWatcher(hass.Hass):
                 "current_power": self.current_power,
                 "power_history_length": len(self.power_history),
                 "cycle_type": self.cycle_type,
-                "predicted_end_time": self.predicted_end_time.isoformat() if self.predicted_end_time else None,
+                "predicted_end_time": self._wall(self.predicted_end_time).isoformat() if self.predicted_end_time else None,
                 "heating_phase_detected": self.heating_phase_detected,
                 "high_spin_phase_detected": self.high_spin_phase_detected,
                 "persons_configured": len(self.persons)
             }
 
             if self.cycle_active and self.cycle_start_time:
-                elapsed = (datetime.now() - self.cycle_start_time).total_seconds() / 60
+                elapsed = (time.time() - self.cycle_start_time) / 60
                 status["elapsed_minutes"] = round(elapsed, 1)
 
             return status
