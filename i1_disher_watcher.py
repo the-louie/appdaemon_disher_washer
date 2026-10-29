@@ -22,6 +22,9 @@ from brief pauses during the cycle and false stops.
 """
 
 import appdaemon.plugins.hass.hassapi as hass
+
+import irisone_bus
+import notification_policy as policy
 import json
 import os
 import time
@@ -37,6 +40,14 @@ class DisherWatcher(hass.Hass):
 
     def initialize(self):
         """Initialize the app"""
+        # A-71.5, outside the try below (which only logs): an older copy of a
+        # shared module on AppDaemon's single import path must stop the app,
+        # where the watchdog sees it, not fail at the first notification.
+        if not hasattr(policy, "should_notify") or not hasattr(irisone_bus, "presence_for_target"):
+            raise RuntimeError(f"stale shared module on the import path: "
+                               f"{policy.__file__}, {irisone_bus.__file__}")
+        # (notification_type, target) -> presence `since` of the last logged drop (O3).
+        self._drop_logged = {}
         try:
             self.log("Initializing Disher Watcher")
 
@@ -567,8 +578,11 @@ class DisherWatcher(hass.Hass):
             sanitized_message = self._sanitize_message(message)
             title = self._sanitize_message(f"Dishwasher Monitor - {notification_type.replace('_', ' ').title()}")
 
-            # Send notifications
-            success_count = 0
+            # Send notifications. Every appliance message is NON_URGENT (owner,
+            # IQ-20): dropped for anyone irisone presence says is away, and a
+            # drop does not start the cooldown.
+            success_count = dropped_count = 0
+            domain = self.get_state(irisone_bus.DOMAIN)
             for person in self.persons:
                 try:
                     if not isinstance(person, dict):
@@ -588,6 +602,15 @@ class DisherWatcher(hass.Hass):
                         self.log(f"No notify service configured for {person_name}", level="WARNING")
                         continue
 
+                    in_home, since = irisone_bus.presence_for_target(domain, notify_service, now)
+                    send, reason = policy.should_notify(policy.NON_URGENT, in_home)
+                    self._report_gate(notification_type, notify_service, send, reason)
+                    if not send:
+                        dropped_count += 1
+                        if policy.drop_log_due(notification_type, notify_service, since, self._drop_logged):
+                            self.log(f"[presence] dropped {self.name}/{notification_type} to {notify_service}: {reason}")
+                        continue
+
                     # Use the correct AppDaemon notification format
                     self.call_service(
                         "notify/{}".format(notify_service),
@@ -605,11 +628,21 @@ class DisherWatcher(hass.Hass):
             if success_count > 0:
                 self.last_notification_time[notification_type] = now
                 self.log(f"Sent {success_count} notification(s) for {notification_type}")
+            elif dropped_count:
+                self.log(f"No notifications sent for {notification_type}: every recipient away")
             else:
                 self.log(f"No notifications sent for {notification_type}", level="WARNING")
 
         except Exception as e:
             self.log(f"Error in send_notifications: {e}", level="ERROR")
+
+    def _report_gate(self, kind, target, send, reason):
+        """Count the decision in irisone.notify_gate_stats (IQ-28). Never blocks a send."""
+        try:
+            self.fire_event(irisone_bus.GATE_EVENT, **irisone_bus.gate_event(
+                self.name, kind, target, policy.NON_URGENT, send, reason))
+        except Exception as e:  # the counter is evidence, not a dependency
+            self.log(f"[presence] could not report gate decision: {e}", level="WARNING")
 
     def _sanitize_message(self, message):
         """Sanitize message for safe transmission"""
